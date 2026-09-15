@@ -251,12 +251,16 @@ def _pane_state(
     posted: str | None,
     claim: int = 0,
     working_since: int | None = None,
+    *,
+    pending: str | None = None,
 ) -> dict[str, str | int | None]:
     state: dict[str, str | int | None] = {"seen": seen, "posted": posted}
     if claim:
         state["claim"] = claim
     if working_since:
         state["working_since"] = working_since
+    if pending:
+        state["pending"] = pending
     return state
 
 
@@ -297,10 +301,17 @@ def _min_working_ok(record: dict | None, min_working_ms: int) -> bool:
 
 
 def _abort_pane_state(
-    record: dict[str, str | int | None] | None, status: str
+    record: dict[str, str | int | None] | None,
+    status: str,
+    *,
+    eligible: bool = False,
 ) -> dict[str, str | int | None]:
+    # Eligibility must come from the current record under the held lock.
     posted = record.get("posted") if record else None
-    return _pane_state(status, posted, _claim_n(record), _working_since_n(record))
+    return _pane_state(
+        status, posted, _claim_n(record), _working_since_n(record),
+        pending=status if eligible and status not in CLEAR_POSTED_STATUSES else None,
+    )
 
 
 def _posted_for_seen(status: str, notify: set[str]) -> str | None:
@@ -325,7 +336,17 @@ def _coerce_pane_state(
     if not seen:
         return None
     posted = _as_status(value.get("posted")) or None
-    return _pane_state(seen, posted, _claim_n(value), _working_since_n(value))
+    pending = _as_status(value.get("pending")) or None
+    if (
+        pending not in notify
+        or pending in CLEAR_POSTED_STATUSES
+        or pending != seen
+        or pending == posted
+    ):
+        pending = None
+    return _pane_state(
+        seen, posted, _claim_n(value), _working_since_n(value), pending=pending
+    )
 
 
 def _normalize_status_store(
@@ -458,11 +479,14 @@ def _should_post(
 ) -> bool:
     if record is None:
         return False
-    # First-seed and unknown/idle → done must not fire. A notify POST
-    # needs a prior seen of working or blocked.
-    if record.get("seen") not in PRIOR_NOTIFY_SEEN:
+    if status not in notify or record.get("posted") == status:
         return False
-    return status in notify and record.get("seen") != status and record.get("posted") != status
+    # A new attempt needs prior working/blocked; an eligible aborted attempt
+    # may retry on the same observed status. All other gates still apply.
+    seen = record.get("seen")
+    if seen in PRIOR_NOTIFY_SEEN and seen != status:
+        return True
+    return record.get("pending") == status and seen == status
 
 
 def _should_retract(
@@ -506,24 +530,35 @@ def _next_pane_state(
         new_posted = _posted_for_seen(status, notify)
     else:
         new_posted = posted
+    pending = None
+    if (
+        record is not None
+        and not posted_now
+        and status not in CLEAR_POSTED_STATUSES
+        and record.get("pending") == status == record.get("seen")
+    ):
+        pending = record["pending"]
     return _pane_state(
-        status, new_posted, claim, _next_working_since(record, status)
+        status, new_posted, claim, _next_working_since(record, status), pending=pending
     )
 
 
 def _release_claim(
     path: str, pane_id: str, status: str, notify: set[str], claim: int
 ) -> None:
-    """Undo this run's posted claim after a failed POST so a later transition can retry."""
+    """Release this run's failed claim so a later same-status event can retry."""
     with _status_lock(path):
         store = _load_or_seed_statuses(path, notify)
         current = store.get(pane_id)
         if current is None or current.get("posted") != status:
             return
+        if current.get("seen") != status:
+            return
         if _claim_n(current) != claim:
             return
         store[pane_id] = _pane_state(
-            current["seen"], None, claim, _working_since_n(current)
+            current["seen"], None, claim, _working_since_n(current),
+            pending=status if status not in CLEAR_POSTED_STATUSES else None,
         )
         _persist_store(path, store)
 
@@ -754,12 +789,12 @@ def main() -> int:
         )
         should_clear = (not should_retract) and _should_clear_posted(record, status)
         if should_post and not _min_working_ok(record, min_working_ms):
-            store[pane_id] = _abort_pane_state(record, status)
+            store[pane_id] = _abort_pane_state(record, status, eligible=should_post)
             _persist_store(status_path, store)
             print(f"min working unconfirmed for {pane_id}", file=sys.stderr)
             return 0
         if should_post and _title_looks_mid_run(info):
-            store[pane_id] = _abort_pane_state(record, status)
+            store[pane_id] = _abort_pane_state(record, status, eligible=should_post)
             _persist_store(status_path, store)
             print(f"settle unconfirmed for {pane_id}", file=sys.stderr)
             return 0
@@ -813,12 +848,18 @@ def main() -> int:
             with _status_lock(status_path):
                 store = _load_or_seed_statuses(status_path, notify)
                 record = store.get(pane_id)
-                store[pane_id] = _abort_pane_state(record, status)
+                # Another run may have claimed or reset this pane while we
+                # sampled. Only the record re-read under this lock can retry.
+                store[pane_id] = _abort_pane_state(
+                    record, status,
+                    eligible=configured and _should_post(record, status, notify),
+                )
                 _persist_store(status_path, store)
             return 0
         with _status_lock(status_path):
             store = _load_or_seed_statuses(status_path, notify)
             record = store.get(pane_id)
+            # An overlapping abort may now have pending == seen == status.
             if (
                 configured
                 and _should_post(record, status, notify)

@@ -26,6 +26,8 @@ class _Recorder(HTTPServer):
     def __init__(self, address, handler):
         super().__init__(address, handler)
         self.requests: list[dict] = []
+        self.post_started = threading.Event()
+        self.post_release = threading.Event()
 
 
 def _handler():
@@ -42,6 +44,12 @@ def _handler():
             )
             if self.path == "/fail":
                 self.send_response(500)
+                self.end_headers()
+                return
+            if self.path in {"/held", "/held-fail"}:
+                self.server.post_started.set()
+                self.server.post_release.wait(timeout=10)
+                self.send_response(500 if self.path == "/held-fail" else 200)
                 self.end_headers()
                 return
             if self.path == "/idle-during-post":
@@ -91,6 +99,7 @@ def _event(**data) -> str:
 class HookTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
         self.config = self.dir / "config"
         self.config.mkdir()
@@ -98,7 +107,7 @@ class HookTests(unittest.TestCase):
         self.stub = self.dir / "herdr"
         self.stub.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, os, sys\n"
+            "import json, os, sys, time\n"
             "from pathlib import Path\n"
             f"Path({str(self.stub_log)!r}).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
             "if len(sys.argv) >= 2 and sys.argv[1:3] == ['agent', 'list']:\n"
@@ -119,6 +128,14 @@ class HookTests(unittest.TestCase):
             "                if isinstance(nxt, str):\n"
             "                    agent['agent_status'] = nxt\n"
             "                elif isinstance(nxt, dict):\n"
+            "                    barrier = nxt.pop('_barrier', '')\n"
+            "                    if barrier:\n"
+            "                        Path(barrier + '.ready').touch()\n"
+            "                        deadline = time.monotonic() + 10\n"
+            "                        while not Path(barrier + '.release').exists():\n"
+            "                            if time.monotonic() >= deadline:\n"
+            "                                raise SystemExit('stub barrier timed out')\n"
+            "                            time.sleep(0.01)\n"
             "                    agent.update(nxt)\n"
             "    print(json.dumps({'result': {'agent': agent}}))\n"
             "    raise SystemExit(0)\n"
@@ -134,9 +151,9 @@ class HookTests(unittest.TestCase):
         self.server.status_path = str(self.config / "last-status.json")
 
     def tearDown(self):
+        self.server.post_release.set()
         self.server.shutdown()
         self.server.server_close()
-        self.tmp.cleanup()
 
     def _write_env(self, extra: str = "", path: str = "/hook") -> None:
         (self.config / ".env").write_text(
@@ -156,6 +173,38 @@ class HookTests(unittest.TestCase):
         path = self.dir / "agent-seq.json"
         path.write_text(json.dumps(items), encoding="utf-8")
         return {"HERDR_STUB_SEQ_PATH": str(path)}
+
+    def _start_paused_settle(self, name: str, sample: str) -> subprocess.Popen:
+        # Pause the fake Herdr at the first settle sample, after the hook
+        # released its initial lock. Each process gets an independent sequence.
+        barrier = self.dir / name
+        path = self.dir / f"{name}-seq.json"
+        path.write_text(json.dumps([
+            "done", {"agent_status": sample, "_barrier": str(barrier)}
+        ]), encoding="utf-8")
+        proc = self._start(
+            _event(),
+            extra_env={"SETTLE_MS": "20", "SETTLE_ROUNDS": "2",
+                       "HERDR_STUB_SEQ_PATH": str(path)},
+            agent={**API, "agent_status": "done"},
+        )
+        self.addCleanup(self._finish_process, proc)
+        self.addCleanup(self._release_settle, name)
+        deadline = time.monotonic() + 5
+        while not Path(str(barrier) + ".ready").exists():
+            if proc.poll() is not None or time.monotonic() >= deadline:
+                self.fail(f"{name} did not reach its settle sample")
+            time.sleep(0.01)
+        return proc
+
+    def _release_settle(self, name: str) -> None:
+        (self.dir / f"{name}.release").touch()
+
+    @staticmethod
+    def _finish_process(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=5)
 
     def _read_status(self) -> dict:
         path = self.config / "last-status.json"
@@ -266,6 +315,7 @@ class HookTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_skip_glob_portrait_pane_does_not_post_or_latch_posted(self):
@@ -509,6 +559,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_seed_list_already_done_event_done_does_not_post(self):
@@ -525,6 +576,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_idle_then_done_does_not_post(self):
@@ -537,6 +589,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", None)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_done_then_done_does_not_post(self):
@@ -730,9 +783,11 @@ class HookTests(unittest.TestCase):
         try:
             time.sleep(0.7)
             self._assert_pane("done", "done")
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
             proc = self._run(_event(agent_status="idle"), agent=API)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self._assert_pane("idle", None)
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
             self._write_env()
             proc = self._run(_event(agent_status="working"), agent=API)
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -749,6 +804,7 @@ class HookTests(unittest.TestCase):
             self.assertEqual(first.returncode, 1, err1)
             self.assertIn("POST failed: HTTP 500", err1)
             self._assert_pane("done", "done")
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
             out2, err2 = second.communicate(timeout=15)
             self.assertEqual(second.returncode, 0, err2)
             proc = self._run(_event(agent_status="working"), agent=API)
@@ -759,6 +815,7 @@ class HookTests(unittest.TestCase):
                 [r["path"] for r in self.server.requests], ["/slow-fail", "/hook"]
             )
             self._assert_pane("done", "done")
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
             self.assertNotIn(FAKE_KEY, out1 + err1 + out2 + err2)
         finally:
             for running in (first, second):
@@ -996,6 +1053,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", None)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_settle_ms_zero_fast_path_does_not_wait(self):
@@ -1186,6 +1244,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(payload["prior_status"], "done")
         self.assertEqual(payload["pane_id"], "w1:p1")
         self._assert_pane("working", None)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self.assertIn("claimed retract POST for w1:p1", proc.stderr)
         self.assertNotIn("claimed done POST", proc.stderr)
         proc = self._run(
@@ -1196,6 +1255,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.server.requests), 1)
         self._assert_pane("working", None)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         proc = self._run(
             _event(),
             extra_env={"RETRACT_ON_RESUME": "1"},
@@ -1207,6 +1267,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(done_payload["status"], "done")
         self.assertNotIn("retracted", done_payload)
         self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_retract_on_resume_zero_does_not_post(self):
@@ -1229,6 +1290,323 @@ class HookTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.server.requests, [])
         self._assert_pane("done", "done")
+        self._assert_no_secrets(proc)
+
+    def test_settle_abort_later_same_done_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        for _ in range(2):
+            proc = self._run(
+                _event(),
+                extra_env={"SETTLE_MS": "20", "SETTLE_ROUNDS": "2",
+                           **self._seq_env(["done"] * 4 + ["working"])},
+                agent={**API, "agent_status": "done"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("settle unconfirmed", proc.stderr)
+            self._assert_pane("done", None)
+            self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+            self.assertEqual(self.server.requests, [])
+        for _ in range(2):
+            proc = self._run(_event(), extra_env={"SETTLE_MS": "0"}, agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self._assert_no_secrets(proc)
+
+    def test_title_abort_later_same_done_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        for _ in range(2):
+            proc = self._run(_event(), agent={**API, "title": "Thinking"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("settle unconfirmed", proc.stderr)
+            self._assert_pane("done", None)
+            self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+            self.assertEqual(self.server.requests, [])
+        for _ in range(2):
+            proc = self._run(_event(), agent={**API, "title": "Finished"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self._assert_no_secrets(proc)
+
+    def test_min_working_abort_later_same_done_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": {
+            "seen": "working", "posted": None, "working_since": int(time.time())
+        }})
+        for _ in range(2):
+            proc = self._run(_event(), extra_env={"MIN_WORKING_MS": "30000"}, agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("min working unconfirmed", proc.stderr)
+            self._assert_pane("done", None)
+            self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+            self.assertEqual(self.server.requests, [])
+        store = self._read_status()
+        store["w1:p1"]["working_since"] = int(time.time()) - 31
+        self._write_status(store)
+        for _ in range(2):
+            proc = self._run(
+                _event(), extra_env={"MIN_WORKING_MS": "30000", "SETTLE_MS": "20"},
+                agent={**API, "agent_status": "done"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self.assertNotIn("working_since", self._read_status()["w1:p1"])
+        self._assert_no_secrets(proc)
+
+    def test_failed_post_same_done_retries_without_working(self):
+        self._write_env(path="/fail")
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self._assert_pane("done", None)
+        self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+        self._write_env()
+        for _ in range(2):
+            proc = self._run(_event(), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([r["path"] for r in self.server.requests], ["/fail", "/hook"])
+        self._assert_pane("done", "done")
+        self.assertEqual(self._read_status()["w1:p1"].get("claim"), 2)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self._assert_no_secrets(proc)
+
+    def test_settle_abort_does_not_silence_overlapping_confirmation(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        aborting = self._start_paused_settle("aborting", "working")
+        confirming = self._start_paused_settle("confirming", "done")
+        self._release_settle("aborting")
+        _, err = aborting.communicate(timeout=5)
+        self.assertEqual(aborting.returncode, 0, err)
+        self.assertIn("settle unconfirmed", err)
+        self._assert_pane("done", None)
+        self._release_settle("confirming")
+        _, err = confirming.communicate(timeout=5)
+        self.assertEqual(confirming.returncode, 0, err)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("done", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_no_secrets(proc)
+
+    def test_stale_settle_abort_after_confirmed_reset_creates_no_pending(self):
+        self._write_env()
+        for status in ("idle", "unknown"):
+            with self.subTest(status=status):
+                self._write_status({"w1:p1": {"seen": "working", "posted": "blocked"}})
+                aborting = self._start_paused_settle(status, "working")
+                proc = self._run(
+                    _event(agent_status=status), extra_env={"SETTLE_MS": "20"},
+                    agent={**API, "agent_status": status},
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self._assert_pane(status, None)
+                self._release_settle(status)
+                _, err = aborting.communicate(timeout=5)
+                self.assertEqual(aborting.returncode, 0, err)
+                self._assert_pane("done", None)
+                self.assertNotIn("pending", self._read_status()["w1:p1"])
+                proc = self._run(_event(), agent=API)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.server.requests, [])
+
+    def test_stale_settle_abort_preserves_newer_posted_claim(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        aborting = self._start_paused_settle("aborting", "working")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        posted = self._read_status()["w1:p1"]
+        self._release_settle("aborting")
+        _, err = aborting.communicate(timeout=5)
+        self.assertEqual(aborting.returncode, 0, err)
+        self.assertEqual(self._read_status()["w1:p1"], posted)
+        self.assertNotIn("pending", posted)
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_genuine_transition_clears_pending_and_idle_done_stays_quiet(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(_event(), agent={**API, "title": "Thinking"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+        for status in ("working", "idle", "done"):
+            proc = self._run(_event(agent_status=status), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self._assert_pane(status, None)
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self.assertEqual(self.server.requests, [])
+
+    def test_pending_normalization_preserves_only_eligible_same_seen(self):
+        self._write_env("NOTIFY_STATUSES=done,blocked,idle,unknown\n")
+        legacy = {"seen": "done", "posted": None, "claim": 4, "working_since": 123}
+        cases = {
+            "flat": ("done", {"seen": "done", "posted": "done"}),
+            "object": (legacy, legacy),
+            "valid": ({**legacy, "pending": " DONE "}, {**legacy, "pending": "done"}),
+            "blocked": ({"seen": "blocked", "posted": None, "pending": "blocked"},
+                        {"seen": "blocked", "posted": None, "pending": "blocked"}),
+            "mismatch": ({**legacy, "pending": "blocked"}, legacy),
+            "posted": ({**legacy, "posted": "done", "pending": "done"},
+                       {**legacy, "posted": "done"}),
+            "not-notify": ({"seen": "working", "posted": None, "pending": "working"},
+                           {"seen": "working", "posted": None}),
+        }
+        for status in ("idle", "unknown"):
+            cases[status] = ({"seen": status, "posted": None, "pending": status},
+                             {"seen": status, "posted": None})
+        for index, pending in enumerate((None, "", "bogus", {}, [], True, 17)):
+            cases[f"malformed-{index}"] = ({**legacy, "pending": pending}, legacy)
+        self._write_status({key: raw for key, (raw, _) in cases.items()})
+        proc = self._run(_event(agent_status="idle"), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        actual = self._read_status()
+        for key, (_, expected) in cases.items():
+            with self.subTest(case=key):
+                self.assertEqual(actual[key], expected)
+        self.assertEqual(self.server.requests, [])
+
+    def test_pending_requires_config_and_notify_membership(self):
+        self._write_env("WEBHOOK_KEY=\n")
+        pending = {"seen": "done", "posted": None, "pending": "done"}
+        self._write_status({"w1:p1": pending})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self._read_status()["w1:p1"], pending)
+        self._write_env("NOTIFY_STATUSES=blocked\n")
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+        self._write_env()
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_pending_is_cleared_for_skipped_pane(self):
+        self._write_env("SKIP_PANES=api\n")
+        self._write_status({"w1:p1": {"seen": "done", "posted": None, "pending": "done"}})
+        proc = self._run(_event(), agent=API)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.server.requests, [])
+        self._assert_pane("done", None)
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+
+    def test_clear_status_aborts_never_create_pending(self):
+        self._write_env("NOTIFY_STATUSES=idle,unknown\n")
+        for status in ("idle", "unknown"):
+            for gate in ("min-working", "title", "settle"):
+                with self.subTest(status=status, gate=gate):
+                    self._write_status({"w1:p1": "working"})
+                    proc = self._run(
+                        _event(agent_status=status),
+                        extra_env={"MIN_WORKING_MS": "30000" if gate == "min-working" else "0",
+                                   "SETTLE_MS": "20" if gate == "settle" else "0"},
+                        agent={**API, "agent_status": "working",
+                               "title": "Thinking" if gate == "title" else "Finished"},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self._assert_pane(status, None)
+                    self.assertNotIn("pending", self._read_status()["w1:p1"])
+                    self.assertEqual(self.server.requests, [])
+
+    def test_title_abort_later_same_blocked_posts_once(self):
+        self._write_env()
+        self._write_status({"w1:p1": "working"})
+        proc = self._run(_event(agent_status="blocked"), agent={**API, "title": "Thinking"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_pane("blocked", None)
+        self.assertEqual(self._read_status()["w1:p1"].get("pending"), "blocked")
+        for _ in range(2):
+            proc = self._run(_event(agent_status="blocked"), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self._assert_pane("blocked", "blocked")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
+
+    def test_pre_http_errors_allow_same_done_retry(self):
+        for config in ("WEBHOOK_URL=invalid\n", "WEBHOOK_KEY_HEADER=bad header\n"):
+            with self.subTest(config=config):
+                self.server.requests.clear()
+                self._write_env(config)
+                self._write_status({"w1:p1": "working"})
+                proc = self._run(_event(), agent=API)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self._assert_pane("done", None)
+                self.assertEqual(self._read_status()["w1:p1"].get("pending"), "done")
+                self.assertEqual(self.server.requests, [])
+                self.assertNotIn(FAKE_KEY, proc.stdout + proc.stderr)
+                self._write_env()
+                proc = self._run(_event(), agent=API)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(len(self.server.requests), 1)
+                self.assertNotIn("pending", self._read_status()["w1:p1"])
+                self._assert_no_secrets(proc)
+
+    def test_failed_post_after_working_does_not_release_or_set_pending(self):
+        self._write_env(path="/held-fail")
+        self._write_status({"w1:p1": "working"})
+        first = self._start(_event(), agent=API)
+        try:
+            self.assertTrue(self.server.post_started.wait(timeout=5))
+            proc = self._run(_event(agent_status="working"), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            current = self._read_status()["w1:p1"]
+            self._assert_pane("working", "done")
+            self.server.post_release.set()
+            _, err = first.communicate(timeout=5)
+            self.assertEqual(first.returncode, 1, err)
+            self.assertEqual(self._read_status()["w1:p1"], current)
+            self.assertNotIn("pending", current)
+            self.assertEqual(len(self.server.requests), 1)
+        finally:
+            self.server.post_release.set()
+            self._finish_process(first)
+
+    def test_pending_retry_claims_before_http_and_overlap_stays_quiet(self):
+        self._write_env(path="/held")
+        self._write_status({"w1:p1": {"seen": "done", "posted": None, "pending": "done"}})
+        first = self._start(_event(), agent=API)
+        try:
+            self.assertTrue(self.server.post_started.wait(timeout=5))
+            self._assert_pane("done", "done")
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
+            proc = self._run(_event(), agent=API)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.server.post_release.set()
+            _, err = first.communicate(timeout=5)
+            self.assertEqual(first.returncode, 0, err)
+            self.assertEqual(len(self.server.requests), 1)
+            self._assert_pane("done", "done")
+            self.assertNotIn("pending", self._read_status()["w1:p1"])
+        finally:
+            self.server.post_release.set()
+            self._finish_process(first)
+
+    def test_failed_retract_does_not_restore_pending(self):
+        self._write_env("RETRACT_ON_RESUME=1\n", path="/fail")
+        self._write_status({"w1:p1": {
+            "seen": "blocked", "posted": "done", "pending": "blocked", "claim": 2
+        }})
+        proc = self._run(
+            _event(agent_status="working"), extra_env={"RETRACT_ON_RESUME": "1"}, agent=API
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertTrue(json.loads(self.server.requests[0]["body"])["retracted"])
+        self._assert_pane("working", "done")
+        self.assertNotIn("pending", self._read_status()["w1:p1"])
         self._assert_no_secrets(proc)
 
     def test_unknown_clears_working_since(self):
